@@ -12,7 +12,11 @@ const EnvSchema = z.object({
   APPWRITE_DATABASE_ID: z.string().min(1),
   BLOXLINK_API_BASE: z.string().url(),
   BLOXLINK_API_KEY: z.string().optional(),
+  STAFF_ROLE_IDS: z.string().transform(str => 
+    str.split(',').map(id => id.trim()).filter(Boolean)
+  ).default(''),
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+  STAFF_CHANNEL_ID: z.string().optional(),
 });
 
 export type AppConfig = z.infer<typeof EnvSchema>;
@@ -28,5 +32,7 @@ export const config = EnvSchema.parse({
   APPWRITE_DATABASE_ID: process.env.APPWRITE_DATABASE_ID,
   BLOXLINK_API_BASE: process.env.BLOXLINK_API_BASE || 'https://api.blox.link/v4',
   BLOXLINK_API_KEY: process.env.BLOXLINK_API_KEY,
+  STAFF_ROLE_IDS: process.env.STAFF_ROLE_IDS || '',
   NODE_ENV: process.env.NODE_ENV,
+  STAFF_CHANNEL_ID: process.env.STAFF_CHANNEL_ID,
 });

@@ -4,14 +4,16 @@ import {
   Collection, 
   Events, 
   type ChatInputCommandInteraction, 
-  type SlashCommandBuilder 
+  type SlashCommandBuilder,
+  type SlashCommandSubcommandsOnlyBuilder,
+  type SlashCommandOptionsOnlyBuilder,
 } from 'discord.js';
 import { ensureCollections } from './services/appwrite.js';
 import { logger } from './utils/logger.js';
 
 // Define command type
 type Command = {
-  data: SlashCommandBuilder;
+  data: SlashCommandBuilder | SlashCommandSubcommandsOnlyBuilder | SlashCommandOptionsOnlyBuilder;
   execute: (interaction: ChatInputCommandInteraction) => Promise<void>;
 };
 
@@ -33,6 +35,8 @@ class ForgieClient extends Client {
 
 // Import commands
 import { data as myinfoCommand, execute as myinfoExecute, handleComponent } from './commands/myinfo.js';
+import { data as setTzCommand, execute as setTzExecute, autocomplete as setTzAutocomplete } from './commands/set-timezone.js';
+import { data as assignTaskCommand, execute as assignTaskExecute, handleComponent as handleTaskComponent } from './commands/assign-task.js';
 
 // Initialize Discord client
 const client = new ForgieClient();
@@ -41,6 +45,14 @@ const client = new ForgieClient();
 client.commands.set(myinfoCommand.name, {
   data: myinfoCommand,
   execute: myinfoExecute
+});
+client.commands.set(setTzCommand.name, {
+  data: setTzCommand,
+  execute: setTzExecute
+});
+client.commands.set(assignTaskCommand.name, {
+  data: assignTaskCommand,
+  execute: assignTaskExecute
 });
 
 // Handle errors
@@ -69,6 +81,16 @@ client.once(Events.ClientReady, async (c) => {
 // Event: Handle slash commands and button interactions
 client.on(Events.InteractionCreate, async interaction => {
   try {
+    if (interaction.isAutocomplete()) {
+      try {
+        if (interaction.commandName === setTzCommand.name) {
+          await setTzAutocomplete(interaction);
+        }
+      } catch (error) {
+        logger.error({ err: error }, 'Autocomplete handler failed');
+      }
+      return;
+    }
     if (interaction.isChatInputCommand()) {
       const command = client.commands.get(interaction.commandName);
       if (!command) return;
@@ -93,7 +115,17 @@ client.on(Events.InteractionCreate, async interaction => {
       }
     } else if (interaction.isButton() || interaction.isStringSelectMenu()) {
       try {
-        await handleComponent(interaction);
+        if (interaction.isButton()) {
+          // Currently only myinfo uses buttons
+          await handleComponent(interaction);
+        } else if (interaction.isStringSelectMenu()) {
+          const cid = interaction.customId;
+          if (cid.startsWith('task:')) {
+            await handleTaskComponent(interaction);
+          } else {
+            await handleComponent(interaction);
+          }
+        }
       } catch (error) {
         logger.error({ err: error }, 'Error handling button interaction');
         

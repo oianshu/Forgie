@@ -15,8 +15,9 @@ import {
 } from 'discord.js';
 import { getTopRole } from '../utils/format.js';
 import { getRobloxInfo } from '../services/bloxlink.js';
-import { upsertUserProfile } from '../services/appwrite.js';
+import { upsertUserProfile, getUserProfile, listUserTasks, getTask, type TaskDocument } from '../services/appwrite.js';
 import { logger } from '../utils/logger.js';
+import { config } from '../config.js';
 
 interface MyInfoPayload {
   embeds: EmbedBuilder[];
@@ -49,6 +50,12 @@ function buildComponents(opts: { back?: boolean } = {}): ActionRowBuilder<Messag
         .setLabel('Server Info')
         .setStyle(ButtonStyle.Secondary)
     );
+    actions.addComponents(
+      new ButtonBuilder()
+        .setCustomId('myinfo_task_panel')
+        .setLabel('Task Panel')
+        .setStyle(ButtonStyle.Secondary)
+    );
   }
 
   rows.push(actions);
@@ -72,6 +79,20 @@ function buildComponents(opts: { back?: boolean } = {}): ActionRowBuilder<Messag
               value: 'view_permissions'
             }
           ])
+      )
+    );
+
+    // Add Staff Handbook and GDD DOCS links in a separate row
+    rows.push(
+      new ActionRowBuilder<MessageActionRowComponentBuilder>().addComponents(
+        new ButtonBuilder()
+          .setStyle(ButtonStyle.Link)
+          .setURL('https://docs.google.com/document/d/19d8TcxOUStYzo4rfkDTvQxQFgT9UOwt4gtuivaU_ZD4/edit?tab=t.0')
+          .setLabel('Staff Handbook'),
+        new ButtonBuilder()
+          .setStyle(ButtonStyle.Link)
+          .setURL('https://docs.google.com/document/d/1mBYL5B9ctTl55SM5O8xwM0Z8vhhAo88gNRBZlq9S_5I/edit?tab=t.0')
+          .setLabel('GDD Document')
       )
     );
   }
@@ -100,6 +121,10 @@ async function buildMyInfoPayload(member: GuildMember): Promise<MyInfoPayload> {
     const joinDate = member.joinedAt ? time(member.joinedAt, TimestampStyles.RelativeTime) : 'Unknown';
     const accountAge = time(user.createdAt, TimestampStyles.RelativeTime);
 
+    // Fetch timezone from Appwrite user profile
+    const existingProfile = await getUserProfile(user.id, member.guild.id);
+    const timezone = existingProfile?.timezone ?? null;
+
     // Save user data to Appwrite
     try {
       await upsertUserProfile({
@@ -116,36 +141,58 @@ async function buildMyInfoPayload(member: GuildMember): Promise<MyInfoPayload> {
       console.error('Failed to save user profile:', e);
     }
 
-    // Create main embed
-    const mainEmbed = new EmbedBuilder()
+    // Check if user has any of the staff roles
+    const isStaff = config.STAFF_ROLE_IDS.length > 0 && 
+      member.roles.cache.some(role => config.STAFF_ROLE_IDS.includes(role.id));
+    
+    // Create user profile embed
+    const userEmbed = new EmbedBuilder()
       .setColor(0x5865F2)
       .setAuthor({
-        name: `User Information - ${user.username}`,
-        iconURL: user.displayAvatarURL()
+        name: `User Profile - ${user.username}`,
+        iconURL: 'https://emoji.discadia.com/emojis/37f0ffee-05fe-40e9-8a15-fce895dd8ba4.PNG'
       })
       .setThumbnail(user.displayAvatarURL({ size: 256 }))
       .addFields(
         formatField('Account Created', accountAge),
         formatField('Server Join Date', joinDate),
-        formatField('Department', topRole ? `<@&${topRole.id}>` : 'None')
+        formatField('Roblox Username', robloxUsername ?? 'Not linked'),
+        formatField('Roblox ID', robloxId ? `[${robloxId}](https://www.roblox.com/users/${robloxId}/profile)` : 'Not linked'),
+        formatField('Mention', user.toString()),
+        formatField('Account Type', user.bot ? 'Bot' : 'User')
       )
       .setFooter({ 
         text: `User ID: ${user.id} • Forgie v${process.env.npm_package_version ?? '0.1.0'}`,
       })
       .setTimestamp();
 
-    // Create secondary embed for additional info
-    const infoEmbed = new EmbedBuilder()
-      .setColor(0x2F3136)
+    // Generate a consistent 4-digit alphanumeric ID based on user ID
+    const userIdHash = user.id.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0);
+    // Ensure we always get a 4-digit alphanumeric code by padding if needed
+    const staffId = Math.abs(userIdHash).toString(36).toUpperCase().padEnd(4, '0').substring(0, 4);
+    
+    // Create staff profile embed (only shown to staff members)
+    const staffEmbed = new EmbedBuilder()
+      .setColor(0x5865F2) // Match user profile color
+      .setAuthor({
+        name: `Staff Profile - ${user.username}`,
+        iconURL: 'https://cdn3.emoji.gg/emojis/9755-discord-staff-animated.gif'
+      })
       .addFields(
-        formatField('Roblox Username', robloxUsername ?? 'Not linked'),
-        formatField('Roblox ID', robloxId ?? 'Not linked'),
-        formatField('Mention', user.toString()),
-        formatField('Account Type', user.bot ? 'Bot' : 'User')
-      );
+        formatField('Status Information', isStaff ? 'Active Staff' : 'Not a Staff Member'),
+        formatField('Department Infomation', topRole ? `<@&${topRole.id}>` : 'None'),
+        formatField('Timezone Infomation', timezone ?? 'No timezone set')
+      )
+      .setFooter({ 
+        text: `Staff ID: ${staffId}`, // Use generated 4-digit ID
+      })
+      .setTimestamp();
+
+    // Only show staff embed to staff members
+    const embeds = isStaff ? [userEmbed, staffEmbed] : [userEmbed];
 
     return {
-      embeds: [mainEmbed, infoEmbed],
+      embeds,
       components: buildComponents()
     };
   } catch (e) {
@@ -221,6 +268,59 @@ export async function handleComponent(interaction: ButtonInteraction | StringSel
       } else if (interaction.customId === 'myinfo_back') {
         const { embeds, components } = await buildMyInfoPayload(member);
         await interaction.editReply({ embeds, components });
+      } else if (interaction.customId === 'myinfo_task_panel') {
+        // Build Task Panel view (concise + grouped + dropdown for details)
+        const tasks = await listUserTasks(member.user.id, member.guild.id);
+        const groups: Record<TaskDocument['status'], TaskDocument[]> = {
+          assigned: [],
+          in_progress: [],
+          blocked: [],
+          done: []
+        };
+        for (const t of tasks) groups[t.status].push(t);
+
+        const mkList = (list: TaskDocument[]) =>
+          (list.length ? list.slice(0, 12).map((t) => `- \`#${t.task_id}\` — ${t.title}`).join('\n') : '_None_');
+
+        const sections: string[] = [];
+        sections.push(`**In Progress (${groups.in_progress.length})**\n${mkList(groups.in_progress)}`);
+        sections.push(`\n**Blocked (${groups.blocked.length})**\n${mkList(groups.blocked)}`);
+        sections.push(`\n**Assigned (${groups.assigned.length})**\n${mkList(groups.assigned)}`);
+        sections.push(`\n**Done (${groups.done.length})**\n${mkList(groups.done)}`);
+
+        const header = tasks.length
+          ? '_Use the dropdown below to view a task in detail._'
+          : 'You have no assigned tasks.';
+
+        const embed = new EmbedBuilder()
+          .setTitle('Your Tasks')
+          .setColor(0x5865F2)
+          .setDescription(`${header}\n\n${sections.join('\n')}`)
+          .setTimestamp();
+
+        // Build dropdown options for details (cap at 25 per Discord limit)
+        const options = tasks.slice(0, 25).map((t) => ({
+          label: t.title.substring(0, 100),
+          description: `#${t.task_id}`.substring(0, 100),
+          value: t.task_id
+        }));
+
+        const rows = [
+          ...buildComponents({ back: true }),
+        ];
+
+        if (options.length) {
+          rows.push(
+            new ActionRowBuilder<MessageActionRowComponentBuilder>().addComponents(
+              new StringSelectMenuBuilder()
+                .setCustomId('myinfo_task_select')
+                .setPlaceholder('Select a task to view details...')
+                .addOptions(options)
+            )
+          );
+        }
+
+        await interaction.editReply({ embeds: [embed], components: rows });
       }
     } else if (interaction.isStringSelectMenu()) {
       const [selected] = interaction.values;
@@ -242,17 +342,55 @@ export async function handleComponent(interaction: ButtonInteraction | StringSel
           components: buildComponents({ back: true })
         });
       } else if (selected === 'view_permissions') {
-        const permissions = member.permissions.toArray().join('\n') || 'No special permissions';
-        
+        const perms = member.permissions.toArray().join(', ') || 'No special permissions';
         const embed = new EmbedBuilder()
           .setTitle('Your Permissions')
-          .setDescription(`\`\`\`\n${permissions}\n\`\`\``)
-          .setColor(0x5865F2);
-        
+          .setColor(0x5865F2)
+          .setDescription(perms);
+
         await interaction.editReply({ 
           embeds: [embed],
           components: buildComponents({ back: true })
         });
+      } else if (interaction.customId === 'myinfo_task_select') {
+        // Show details for a specific task
+        const taskId = selected;
+        const task = await getTask(taskId);
+        if (!task) {
+          const embed = new EmbedBuilder()
+            .setTitle('Task Details')
+            .setColor(0xED4245)
+            .setDescription('Task not found or no longer available.');
+          await interaction.editReply({ embeds: [embed], components: buildComponents({ back: true }) });
+          return;
+        }
+
+        const due = task.due_date ? time(new Date(task.due_date), TimestampStyles.LongDateTime) : 'Not set';
+        const thread = task.thread_id ? `<#${task.thread_id}>` : 'Not created';
+        const embed = new EmbedBuilder()
+          .setTitle(`#${task.task_id} — ${task.title}`)
+          .setColor(0x5865F2)
+          .setDescription(task.description || 'No description provided.')
+          .addFields(
+            { name: 'Status', value: task.status.replace(/_/g, ' '), inline: true },
+            { name: 'Progress', value: `${task.progress}%`, inline: true },
+            { name: 'Priority', value: (task.priority || 'medium').toUpperCase(), inline: true },
+            { name: 'Due', value: String(due), inline: true },
+            { name: 'Thread', value: thread, inline: true },
+          )
+          .setTimestamp();
+
+        // Keep back buttons visible: Back to Profile and Back to Task Panel
+        const backRows: ActionRowBuilder<MessageActionRowComponentBuilder>[] = [
+          ...buildComponents({ back: true }),
+          new ActionRowBuilder<MessageActionRowComponentBuilder>().addComponents(
+            new ButtonBuilder()
+              .setCustomId('myinfo_task_panel')
+              .setLabel('Back to Task Panel')
+              .setStyle(ButtonStyle.Secondary)
+          )
+        ];
+        await interaction.editReply({ embeds: [embed], components: backRows });
       }
     }
   } catch (error) {
